@@ -1,0 +1,173 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,bm,mathtools}
+\usepackage{enumitem}
+\usepackage{hyperref}
+
+\title{GeneMamba Algorithm: Mathematical Formulation with Dimensions}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+This document formalizes the algorithm currently implemented in the repository.
+
+\section{Input Construction (Gene-Rank Token Sequence)}
+For each cell, define:
+\begin{itemize}[leftmargin=2em]
+  \item $G$: number of genes in the raw expression vector,
+  \item $L$: model sequence length (\texttt{seq\_len}),
+  \item $B$: batch size,
+  \item $V$: tokenizer vocabulary size.
+\end{itemize}
+
+A cell has expression vector
+\begin{equation}
+\bm{e} \in \mathbb{R}^{G}.
+\end{equation}
+Genes are sorted in descending expression to obtain a permutation $\pi$ such that
+\begin{equation}
+e_{\pi(1)} \ge e_{\pi(2)} \ge \cdots \ge e_{\pi(G)}.
+\end{equation}
+After mapping genes to token IDs, we have
+\begin{equation}
+\bm{x} = (x_1,\ldots,x_G),\qquad x_i \in \{0,\ldots,V-1\}.
+\end{equation}
+Truncation/padding to length $L$ yields
+\begin{equation}
+\tilde{\bm{x}} \in \{0,\ldots,V-1\}^{L},
+\end{equation}
+and a batch is
+\begin{equation}
+\bm{X} \in \mathbb{N}^{B\times L}.
+\end{equation}
+
+\section{Embedding and Bidirectional Mamba Mixer}
+Let model width be $d$ (\texttt{d\_model}) and number of mixer layers be $N$ (\texttt{mamba\_layer}).
+
+Embedding table:
+\begin{equation}
+\bm{E} \in \mathbb{R}^{V\times d}.
+\end{equation}
+Token embeddings:
+\begin{equation}
+\bm{H}^{(0)} = \bm{E}[\bm{X}] \in \mathbb{R}^{B\times L\times d}.
+\end{equation}
+
+For each layer $\ell\in\{1,\dots,N\}$:
+\begin{align}
+\bm{F}^{(\ell)} &= f_\ell\!\left(\bm{H}^{(\ell-1)}\right),\\
+\bm{R}^{(\ell)} &= f_\ell\!\left(\operatorname{Flip}(\bm{H}^{(\ell-1)})\right),
+\end{align}
+where $\operatorname{Flip}(\cdot)$ reverses the sequence dimension (with masking-aware flip when padding is present), and then the reverse stream is flipped back before aggregation.
+
+Aggregation mode options:
+\begin{enumerate}[leftmargin=2em,label=(\alph*)]
+  \item \textbf{mean}
+  \begin{equation}
+  \bm{H}^{(\ell)} = \tfrac{1}{2}\left(\bm{F}^{(\ell)} + \bm{R}^{(\ell)}\right).
+  \end{equation}
+
+  \item \textbf{sum}
+  \begin{equation}
+  \bm{H}^{(\ell)} = \bm{F}^{(\ell)} + \bm{R}^{(\ell)}.
+  \end{equation}
+
+  \item \textbf{concat}
+  \begin{equation}
+  \bm{H}^{(\ell)} = \bm{W}_a\,[\bm{F}^{(\ell)}\|\bm{R}^{(\ell)}] + \bm{b}_a,
+  \qquad
+  \bm{W}_a\in\mathbb{R}^{d\times 2d}.
+  \end{equation}
+
+  \item \textbf{gate}
+  \begin{align}
+  \bm{Z}^{(\ell)} &= \sigma\!\left(\bm{W}_a[\bm{F}^{(\ell)}\|\bm{R}^{(\ell)}] + \bm{b}_a\right),\\
+  \bm{H}^{(\ell)} &= \bm{Z}^{(\ell)}\odot\bm{F}^{(\ell)} + \left(1-\bm{Z}^{(\ell)}\right)\odot\bm{R}^{(\ell)}.
+  \end{align}
+\end{enumerate}
+
+Final normalization and LM head:
+\begin{align}
+\hat{\bm{H}} &= \operatorname{RMSNorm}(\bm{H}^{(N)}) \in \mathbb{R}^{B\times L\times d},\\
+\bm{Z}_{\mathrm{lm}} &= \hat{\bm{H}}\bm{W}_{\mathrm{lm}}^{\top} + \bm{b}_{\mathrm{lm}}
+\in \mathbb{R}^{B\times L\times V},
+\end{align}
+with $\bm{W}_{\mathrm{lm}}\in\mathbb{R}^{V\times d}$.
+
+\section{Autoregressive Language-Model Loss}
+Using a one-token shift:
+\begin{equation}
+\mathcal{L}_{\mathrm{LM}} =
+\operatorname{CE}\left(
+\bm{Z}_{\mathrm{lm}}[:,0{:}L-1,:],
+\bm{X}[:,1{:}L]
+\right).
+\end{equation}
+Equivalent scalar form:
+\begin{equation}
+\mathcal{L}_{\mathrm{LM}} = -\frac{1}{B(L-1)}
+\sum_{b=1}^{B}\sum_{t=1}^{L-1}
+\log p(x_{b,t+1}\mid x_{b,1:t}).
+\end{equation}
+
+\section{Co-expression Contrastive Term (InfoNCE-like)}
+Flatten hidden states:
+\begin{equation}
+\bm{h}_n\in\mathbb{R}^{d},\qquad n=1,\ldots,BL,
+\end{equation}
+and normalize:
+\begin{equation}
+\bar{\bm{h}}_n = \frac{\bm{h}_n}{\lVert\bm{h}_n\rVert_2}.
+\end{equation}
+
+After removing PAD/UNK tokens, keep valid IDs and embeddings. A sparse co-expression graph provides pair labels
+\begin{equation}
+y_{ij}\in\{0,1\}.
+\end{equation}
+For each selected pair:
+\begin{equation}
+s_{ij}=\bar{\bm{h}}_i^{\top}\bar{\bm{h}}_j\in[-1,1],
+\qquad
+\ell_{ij}=\frac{s_{ij}}{\tau},
+\end{equation}
+with temperature $\tau=0.1$.
+
+Let
+\begin{equation}
+\mathcal{P}=\{(i,j):y_{ij}=1\},
+\qquad
+\mathcal{A}=\{\text{all selected pairs}\}.
+\end{equation}
+Implemented loss:
+\begin{equation}
+\mathcal{L}_{\mathrm{NCE}} = -\frac{1}{|\mathcal{P}|}
+\sum_{(i,j)\in\mathcal{P}}
+\left(
+\ell_{ij} - \log\sum_{(u,v)\in\mathcal{A}} e^{\ell_{uv}}
+\right).
+\end{equation}
+
+\section{Final Objective}
+With weighting $\gamma=0.1$:
+\begin{equation}
+\mathcal{L} = \mathcal{L}_{\mathrm{LM}} + \gamma\,\mathcal{L}_{\mathrm{NCE}}.
+\end{equation}
+
+\section{Downstream Cell-Level Classification Head}
+Given hidden states $\hat{\bm{H}}\in\mathbb{R}^{B\times L\times d}$, cell representation is mean pooling:
+\begin{equation}
+\bm{c}_b = \frac{1}{L}\sum_{t=1}^{L}\hat{\bm{H}}_{b,t,:}\in\mathbb{R}^{d}.
+\end{equation}
+Then an MLP classifier maps
+\begin{equation}
+\bm{c}_b \mapsto \mathbb{R}^{C},
+\end{equation}
+where $C$ is the class count.
+
+\paragraph{Implementation note.}
+In \texttt{EncoderLayer.forward}, the code computes
+\texttt{output = self.mamba(X) + X} but returns \texttt{X}; therefore each encoder layer currently behaves as identity in the active code path.
+
+\end{document}
